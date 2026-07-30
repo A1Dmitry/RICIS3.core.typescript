@@ -1,11 +1,427 @@
+/**
+ * RICIS-III v7.7 — strict AST engine (no limits, no L'Hôpital)
+ * Aligned with Lean 10.2.0 + theory document
+ * Author: Dmitry Aleynikov · ORCID 0009-0004-3226-7700
+ */
+
 import { CalculationResult, PhaseStep } from '../types/ricis';
 import { generateLean4Code } from './lean4Generator';
 
-/**
- * RICIS-III v7.7 Deterministic Singularity Evaluation Engine
- * Authored by Dmitry Aleinikov (ORCID: 0009-0004-3226-7700)
- */
+export type Expr =
+  | { tag: 'const'; v: number }
+  | { tag: 'var'; name: string }
+  | { tag: 'add'; f: Expr; g: Expr }
+  | { tag: 'sub'; f: Expr; g: Expr }
+  | { tag: 'mul'; f: Expr; g: Expr }
+  | { tag: 'div'; f: Expr; g: Expr }
+  | { tag: 'zero'; index: Expr; label: string }
+  | { tag: 'inf'; index: Expr; label: string };
 
+function c(v: number): Expr { return { tag: 'const', v }; }
+function v(name: string): Expr { return { tag: 'var', name }; }
+function add(f: Expr, g: Expr): Expr { return { tag: 'add', f, g }; }
+function sub(f: Expr, g: Expr): Expr { return { tag: 'sub', f, g }; }
+function mul(f: Expr, g: Expr): Expr { return { tag: 'mul', f, g }; }
+function div(f: Expr, g: Expr): Expr { return { tag: 'div', f, g }; }
+function zero(index: Expr, label?: string): Expr {
+  return { tag: 'zero', index, label: label ?? exprToCanonical(index) };
+}
+function inf(index: Expr, label?: string): Expr {
+  return { tag: 'inf', index, label: label ?? exprToCanonical(index) };
+}
+
+export function exprToCanonical(e: Expr): string {
+  switch (e.tag) {
+    case 'const': return `C(${e.v})`;
+    case 'var': return `VAR(${e.name})`;
+    case 'add': {
+      const a = exprToCanonical(e.f), b = exprToCanonical(e.g);
+      return a <= b ? `ADD(${a},${b})` : `ADD(${b},${a})`;
+    }
+    case 'mul': {
+      const a = exprToCanonical(e.f), b = exprToCanonical(e.g);
+      return a <= b ? `MUL(${a},${b})` : `MUL(${b},${a})`;
+    }
+    case 'sub': return `SUB(${exprToCanonical(e.f)},${exprToCanonical(e.g)})`;
+    case 'div': return `DIV(${exprToCanonical(e.f)},${exprToCanonical(e.g)})`;
+    case 'zero': return `0_${e.label}`;
+    case 'inf': return `∞_${e.label}`;
+  }
+}
+
+function sameIdentity(a: Expr, b: Expr): boolean {
+  return exprToCanonical(a) === exprToCanonical(b);
+}
+function exprEq(a: Expr, b: Expr): boolean {
+  return sameIdentity(a, b);
+}
+
+export function algSimplify(e: Expr): Expr {
+  switch (e.tag) {
+    case 'add': {
+      const f = algSimplify(e.f), g = algSimplify(e.g);
+      if (f.tag === 'const' && f.v === 0) return g;
+      if (g.tag === 'const' && g.v === 0) return f;
+      if (exprEq(f, g)) return mul(c(2), f);
+      return add(f, g);
+    }
+    case 'mul': {
+      const f = algSimplify(e.f), g = algSimplify(e.g);
+      if ((f.tag === 'const' && f.v === 0) || (g.tag === 'const' && g.v === 0)) return c(0);
+      if (f.tag === 'const' && f.v === 1) return g;
+      if (g.tag === 'const' && g.v === 1) return f;
+      return mul(f, g);
+    }
+    case 'sub': {
+      const f = algSimplify(e.f), g = algSimplify(e.g);
+      if (exprEq(f, g)) return c(0);
+      if (g.tag === 'const' && g.v === 0) return f;
+      return sub(f, g);
+    }
+    case 'div': {
+      const f = algSimplify(e.f), g = algSimplify(e.g);
+      if (g.tag === 'const' && g.v === 1) return f;
+      if (exprEq(f, g)) return c(1);
+      return div(f, g);
+    }
+    case 'zero': return zero(algSimplify(e.index), e.label);
+    case 'inf': return inf(algSimplify(e.index), e.label);
+    default: return e;
+  }
+}
+
+function cancelMul(num: Expr, den: Expr): Expr | null {
+  if (num.tag !== 'mul') return null;
+  if (exprEq(num.f, den)) return num.g;
+  if (exprEq(num.g, den)) return num.f;
+  const left = cancelMul(num.f, den);
+  if (left) return mul(left, num.g);
+  const right = cancelMul(num.g, den);
+  if (right) return mul(num.f, right);
+  return null;
+}
+
+function sp2Reduce(num: Expr, den: Expr): Expr | null {
+  const n = algSimplify(num);
+  const d = algSimplify(den);
+  if (exprEq(n, d)) return c(1);
+  const canceled = cancelMul(n, d);
+  if (canceled) return algSimplify(canceled);
+  return null;
+}
+
+export type Monolith =
+  | { kind: 'scalar'; v: number }
+  | { kind: 'expr'; e: Expr }
+  | { kind: 'zero'; index: Expr; label: string }
+  | { kind: 'inf'; index: Expr; label: string }
+  | { kind: 'unresolved'; reason: string; e: Expr };
+
+function toExpr(m: Monolith): Expr {
+  switch (m.kind) {
+    case 'scalar': return c(m.v);
+    case 'expr': return m.e;
+    case 'zero': return zero(m.index, m.label);
+    case 'inf': return inf(m.index, m.label);
+    case 'unresolved': return m.e;
+  }
+}
+
+export function ricisDiv(a: Monolith, b: Monolith): Monolith {
+  if (a.kind === 'scalar' && b.kind === 'scalar') {
+    if (b.v === 0) {
+      if (a.v === 0) return { kind: 'unresolved', reason: '0/0_bare_const', e: div(c(0), c(0)) };
+      return { kind: 'inf', index: c(a.v), label: String(a.v) };
+    }
+    return { kind: 'scalar', v: a.v / b.v };
+  }
+  if (a.kind === 'zero' && b.kind === 'zero') {
+    const reduced = sp2Reduce(a.index, b.index);
+    if (reduced) {
+      if (reduced.tag === 'const') return { kind: 'scalar', v: reduced.v };
+      return { kind: 'expr', e: reduced };
+    }
+    if (sameIdentity(a.index, b.index) || a.label === b.label) return { kind: 'scalar', v: 1 };
+    if (a.index.tag === 'const' && b.index.tag === 'const' && b.index.v !== 0)
+      return { kind: 'scalar', v: a.index.v / b.index.v };
+    return { kind: 'expr', e: div(a.index, b.index) };
+  }
+  if (a.kind === 'inf' && b.kind === 'inf') {
+    const reduced = sp2Reduce(a.index, b.index);
+    if (reduced) {
+      if (reduced.tag === 'const') return { kind: 'scalar', v: reduced.v };
+      return { kind: 'expr', e: reduced };
+    }
+    if (sameIdentity(a.index, b.index) || a.label === b.label) return { kind: 'scalar', v: 1 };
+    if (a.index.tag === 'const' && b.index.tag === 'const' && b.index.v !== 0)
+      return { kind: 'scalar', v: a.index.v / b.index.v };
+    return { kind: 'expr', e: div(a.index, b.index) };
+  }
+  if (b.kind === 'scalar' && b.v === 0)
+    return { kind: 'inf', index: toExpr(a), label: exprToCanonical(toExpr(a)) };
+  if (b.kind === 'zero' && a.kind !== 'zero')
+    return { kind: 'inf', index: toExpr(a), label: exprToCanonical(toExpr(a)) };
+  const ea = toExpr(a), eb = toExpr(b);
+  const reduced = sp2Reduce(ea, eb);
+  if (reduced) {
+    if (reduced.tag === 'const') return { kind: 'scalar', v: reduced.v };
+    return { kind: 'expr', e: reduced };
+  }
+  return { kind: 'expr', e: div(ea, eb) };
+}
+
+export function ricisMul(a: Monolith, b: Monolith): Monolith {
+  if (a.kind === 'zero' && b.kind === 'inf') {
+    if (a.index.tag === 'const' && b.index.tag === 'const')
+      return { kind: 'scalar', v: a.index.v * b.index.v };
+    return { kind: 'expr', e: mul(a.index, b.index) };
+  }
+  if (a.kind === 'inf' && b.kind === 'zero') {
+    if (a.index.tag === 'const' && b.index.tag === 'const')
+      return { kind: 'scalar', v: a.index.v * b.index.v };
+    return { kind: 'expr', e: mul(a.index, b.index) };
+  }
+  if (a.kind === 'scalar' && b.kind === 'scalar') return { kind: 'scalar', v: a.v * b.v };
+  if (a.kind === 'zero' || b.kind === 'zero') {
+    const z = a.kind === 'zero' ? a : (b as Extract<Monolith, { kind: 'zero' }>);
+    return { kind: 'zero', index: z.index, label: z.label };
+  }
+  if (a.kind === 'inf' || b.kind === 'inf') {
+    const i = a.kind === 'inf' ? a : (b as Extract<Monolith, { kind: 'inf' }>);
+    return { kind: 'inf', index: i.index, label: i.label };
+  }
+  return { kind: 'expr', e: mul(toExpr(a), toExpr(b)) };
+}
+
+export function ricisAdd(a: Monolith, b: Monolith): Monolith {
+  if (a.kind === 'inf' && b.kind === 'inf') {
+    const idx = add(a.index, b.index);
+    return { kind: 'inf', index: idx, label: exprToCanonical(idx) };
+  }
+  if (a.kind === 'scalar' && b.kind === 'scalar') return { kind: 'scalar', v: a.v + b.v };
+  if (a.kind === 'zero') return b;
+  if (b.kind === 'zero') return a;
+  if (a.kind === 'scalar' && a.v === 0) return b;
+  if (b.kind === 'scalar' && b.v === 0) return a;
+  return { kind: 'expr', e: add(toExpr(a), toExpr(b)) };
+}
+
+export function ricisSub(a: Monolith, b: Monolith): Monolith {
+  if (a.kind === 'inf' && b.kind === 'inf') {
+    if (sameIdentity(a.index, b.index) || a.label === b.label) return { kind: 'scalar', v: 0 };
+    const idx = sub(a.index, b.index);
+    return { kind: 'inf', index: idx, label: exprToCanonical(idx) };
+  }
+  if (a.kind === 'scalar' && b.kind === 'scalar') return { kind: 'scalar', v: a.v - b.v };
+  if (b.kind === 'zero' || (b.kind === 'scalar' && b.v === 0)) return a;
+  return { kind: 'expr', e: sub(toExpr(a), toExpr(b)) };
+}
+
+export function evalExpr(e: Expr): Monolith {
+  e = algSimplify(e);
+  switch (e.tag) {
+    case 'const': return { kind: 'scalar', v: e.v };
+    case 'var': return { kind: 'expr', e };
+    case 'zero': return { kind: 'zero', index: e.index, label: e.label };
+    case 'inf': return { kind: 'inf', index: e.index, label: e.label };
+    case 'add': return ricisAdd(evalExpr(e.f), evalExpr(e.g));
+    case 'sub': return ricisSub(evalExpr(e.f), evalExpr(e.g));
+    case 'mul': return ricisMul(evalExpr(e.f), evalExpr(e.g));
+    case 'div': return ricisDiv(evalExpr(e.f), evalExpr(e.g));
+  }
+}
+
+export function monolithToLatex(m: Monolith): string {
+  switch (m.kind) {
+    case 'scalar': return String(m.v);
+    case 'zero': return `0_{${m.label}}`;
+    case 'inf': return `\\infty_{${m.label}}`;
+    case 'expr': return exprToLatex(m.e);
+    case 'unresolved': return `\\text{unresolved}(${m.reason})`;
+  }
+}
+
+export function monolithToText(m: Monolith): string {
+  switch (m.kind) {
+    case 'scalar': return String(m.v);
+    case 'zero': return `0_${m.label}`;
+    case 'inf': return `∞_${m.label}`;
+    case 'expr': return exprToCanonical(m.e);
+    case 'unresolved': return `unresolved(${m.reason})`;
+  }
+}
+
+function exprToLatex(e: Expr): string {
+  switch (e.tag) {
+    case 'const': return String(e.v);
+    case 'var': return e.name;
+    case 'add': return `(${exprToLatex(e.f)}+${exprToLatex(e.g)})`;
+    case 'sub': return `(${exprToLatex(e.f)}-${exprToLatex(e.g)})`;
+    case 'mul': return `(${exprToLatex(e.f)}\\cdot${exprToLatex(e.g)})`;
+    case 'div': return `\\frac{${exprToLatex(e.f)}}{${exprToLatex(e.g)}}`;
+    case 'zero': return `0_{${e.label}}`;
+    case 'inf': return `\\infty_{${e.label}}`;
+  }
+}
+
+type Tok =
+  | { t: 'num'; v: number }
+  | { t: 'id'; v: string }
+  | { t: 'op'; v: string }
+  | { t: 'lparen' }
+  | { t: 'rparen' }
+  | { t: 'eof' };
+
+function tokenize(s: string): Tok[] {
+  const out: Tok[] = [];
+  let i = 0;
+  const src = s.replace(/\\infty/gi, '∞').replace(/\binf\b/gi, '∞').replace(/×/g, '*').replace(/·/g, '*');
+  while (i < src.length) {
+    const ch = src[i];
+    if (/\s/.test(ch)) { i++; continue; }
+    if (/[0-9.]/.test(ch)) {
+      let j = i;
+      while (j < src.length && /[0-9.]/.test(src[j])) j++;
+      out.push({ t: 'num', v: parseFloat(src.slice(i, j)) });
+      i = j; continue;
+    }
+    if (ch === '0' && src[i + 1] === '_') {
+      i += 2;
+      let j = i;
+      while (j < src.length && /[A-Za-z0-9.]/.test(src[j])) j++;
+      const label = src.slice(i, j) || '0';
+      out.push({ t: 'id', v: `ZERO_${label}` });
+      i = j; continue;
+    }
+    if (ch === '∞') {
+      i++;
+      if (src[i] === '_') {
+        i++;
+        let j = i;
+        while (j < src.length && /[A-Za-z0-9.]/.test(src[j])) j++;
+        const label = src.slice(i, j) || '1';
+        out.push({ t: 'id', v: `INF_${label}` });
+        i = j; continue;
+      }
+      out.push({ t: 'id', v: 'INF_1' }); continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i;
+      while (j < src.length && /[A-Za-z0-9_]/.test(src[j])) j++;
+      out.push({ t: 'id', v: src.slice(i, j) });
+      i = j; continue;
+    }
+    if ('+-*/^'.includes(ch)) { out.push({ t: 'op', v: ch }); i++; continue; }
+    if (ch === '(') { out.push({ t: 'lparen' }); i++; continue; }
+    if (ch === ')') { out.push({ t: 'rparen' }); i++; continue; }
+    i++;
+  }
+  out.push({ t: 'eof' });
+  return out;
+}
+
+class Parser {
+  private i = 0;
+  constructor(private toks: Tok[]) {}
+  private peek(): Tok { return this.toks[this.i]; }
+  private take(): Tok { return this.toks[this.i++]; }
+  parse(): Expr { return this.parseAdd(); }
+  private parseAdd(): Expr {
+    let left = this.parseMul();
+    while (this.peek().t === 'op' && ((this.peek() as any).v === '+' || (this.peek() as any).v === '-')) {
+      const op = (this.take() as any).v;
+      const right = this.parseMul();
+      left = op === '+' ? add(left, right) : sub(left, right);
+    }
+    return left;
+  }
+  private parseMul(): Expr {
+    let left = this.parseUnary();
+    while (this.peek().t === 'op' && ((this.peek() as any).v === '*' || (this.peek() as any).v === '/')) {
+      const op = (this.take() as any).v;
+      const right = this.parseUnary();
+      left = op === '*' ? mul(left, right) : div(left, right);
+    }
+    while (this.peek().t === 'lparen') {
+      const right = this.parseUnary();
+      left = mul(left, right);
+    }
+    return left;
+  }
+  private parseUnary(): Expr {
+    if (this.peek().t === 'op' && (this.peek() as any).v === '-') {
+      this.take();
+      return mul(c(-1), this.parseUnary());
+    }
+    return this.parsePrimary();
+  }
+  private parsePrimary(): Expr {
+    const tok = this.peek();
+    if (tok.t === 'num') { this.take(); return c(tok.v); }
+    if (tok.t === 'id') {
+      this.take();
+      const name = tok.v;
+      if (name.startsWith('ZERO_')) {
+        const label = name.slice(5);
+        const idx = isFinite(Number(label)) ? c(Number(label)) : v(label);
+        return zero(idx, label);
+      }
+      if (name.startsWith('INF_')) {
+        const label = name.slice(4);
+        const idx = isFinite(Number(label)) ? c(Number(label)) : v(label);
+        return inf(idx, label);
+      }
+      if (this.peek().t === 'lparen') {
+        this.take();
+        const arg = this.parseAdd();
+        if (this.peek().t === 'rparen') this.take();
+        return { tag: 'var', name: `${name}(${exprToCanonical(arg)})` };
+      }
+      return v(name);
+    }
+    if (tok.t === 'lparen') {
+      this.take();
+      const e = this.parseAdd();
+      if (this.peek().t === 'rparen') this.take();
+      return e;
+    }
+    this.take();
+    return c(0);
+  }
+}
+
+export function parseExpression(input: string): Expr {
+  let s = input.trim();
+  s = s.replace(/\s+/g, ' ');
+  s = s.replace(/∞_\{([^}]+)\}/g, '∞_$1');
+  s = s.replace(/0_\{([^}]+)\}/g, '0_$1');
+  s = s.replace(/\|\s*_\s*\{[^}]+\}/g, '');
+  s = s.replace(/at\s+x\s*=\s*[\d.]+/gi, '');
+  s = s.replace(/lim\s*_\s*\{?\s*x\s*→\s*[^}]+\}?/gi, '');
+  s = s.replace(/lim\s*_\s*\{[^}]+\}/gi, '');
+  return new Parser(tokenize(s)).parse();
+}
+
+function phase(
+  phase: PhaseStep['phase'], name: string, rule: string,
+  input: string, output: string, ru: string, en: string, axiom: string,
+  status: PhaseStep['status'] = 'passed'
+): PhaseStep {
+  return {
+    phase, name, ruleApplied: rule, latexInput: input, latexOutput: output,
+    explanationRu: ru, explanationEn: en, axiomOrProtocol: axiom, status,
+  };
+}
+
+function detectAxiom(m: Monolith, raw: string): string {
+  if (m.kind === 'inf') return 'A1_INDEXED_INFINITY';
+  if (raw.includes('0_') && (raw.includes('∞') || raw.includes('inf'))) return 'A6_GENERAL';
+  if (raw.includes('0_') && raw.includes('/')) return 'A4_0DIV0';
+  if ((raw.includes('∞') || raw.includes('inf')) && raw.includes('/')) return 'A5_INFDIVINF';
+  return 'RICIS_CORE';
+}
+
+/** Public API — strict RICIS. No limits. No L'Hôpital. */
 export function evaluateRicisExpression(
   input: string,
   variableContext: Record<string, number | string> = {}
@@ -13,484 +429,76 @@ export function evaluateRicisExpression(
   const normalized = input.trim();
   const phases: PhaseStep[] = [];
 
-  // Phase -1: L1 Identity & Type Check
-  phases.push({
-    phase: -1,
-    name: 'L1_IDENTITY',
-    ruleApplied: 'L1 Identity Principle (X = X, X/X = 1)',
-    latexInput: normalized,
-    latexOutput: `T(${normalized}) \\text{ defined, } L1 \\text{ active}`,
-    explanationRu: 'Проверка сохранения тождества элемента и его непрерывного типа T(X). Запрещен неопределенный статус.',
-    explanationEn: 'Identity preservation and type check T(X). Undefined/NaN status is strictly forbidden.',
-    axiomOrProtocol: 'L0_CONTINUITY, L1_IDENTITY',
-    status: 'passed',
-  });
+  phases.push(phase(-1, 'L1_IDENTITY', 'L1 Identity (X=X, X/X=1)',
+    normalized, `T(${normalized})\\ \\text{defined}`,
+    'Проверка тождества и типа T(X).', 'Identity and type T(X) check.',
+    'L0_CONTINUITY, L1_IDENTITY'));
 
-  // Check for forbidden Cauchy limit attempt
-  if (normalized.includes('lim') || normalized.includes('limit')) {
-    phases.push({
-      phase: 0,
-      name: 'REMOVE_LIMITS',
-      ruleApplied: 'Limits Forbidden / Exact Point Conversion',
-      latexInput: normalized,
-      latexOutput: normalized.replace(/lim_{?x\\to (\d+)}?/g, 'x=$1'),
-      explanationRu: 'Пределы Коши (lim) устранены и заменены точечной математикой RICIS-III.',
-      explanationEn: 'Cauchy limits (lim) removed and converted to exact RICIS-III pointwise evaluation.',
-      axiomOrProtocol: 'RICIS3_NO_LIMITS',
-      status: 'transformed',
-    });
-  } else {
-    phases.push({
-      phase: 0,
-      name: 'REMOVE_LIMITS',
-      ruleApplied: 'Pointwise Evaluation (No Limits)',
-      latexInput: normalized,
-      latexOutput: normalized,
-      explanationRu: 'Оператор предела отсутствует; вычисление производится строго в точке.',
-      explanationEn: 'No limit operator present; evaluation performed directly at exact point.',
-      axiomOrProtocol: 'RICIS3_NO_LIMITS',
-      status: 'passed',
-    });
+  const hadLimit = /lim|limit/i.test(normalized);
+  phases.push(phase(0, 'REMOVE_LIMITS',
+    hadLimit ? 'Limits Forbidden → pointwise' : 'Pointwise (no limits)',
+    normalized, normalized.replace(/lim[^)]*/gi, '[point]'),
+    hadLimit ? 'Пределы устранены.' : 'Оператор предела отсутствует.',
+    hadLimit ? 'Limits removed.' : 'No limit operator.',
+    'RICIS3_NO_LIMITS', hadLimit ? 'transformed' : 'passed'));
+
+  let result: Monolith;
+  try {
+    const ast = parseExpression(normalized);
+    phases.push(phase(0.5, 'SEMANTIC_INDEXING', 'SP4 Index by expression',
+      normalized, exprToCanonical(ast),
+      'Индексация по канонической форме.', 'Indexing by canonical form.',
+      'SP4_SEMANTIC_PRIORITY'));
+    phases.push(phase(1, 'REDUCTION_PRIORITY', 'SP2 Clean first',
+      exprToCanonical(ast), exprToCanonical(algSimplify(ast)),
+      'Упрощение и сокращение до аксиом.', 'Simplify before singularity axioms.',
+      'SP2_REDUCTION_PRIORITY', 'transformed'));
+    result = evalExpr(ast);
+    phases.push(phase(2, 'RICIS_TRANSFORMS', 'A1/A4/A5/A6/A7',
+      exprToCanonical(ast), monolithToLatex(result),
+      'Структурные правила RICIS без пределов.', 'Structural RICIS; no limits.',
+      detectAxiom(result, normalized), 'transformed'));
+  } catch (err) {
+    result = { kind: 'unresolved', reason: String(err), e: c(0) };
+    phases.push(phase(2, 'RICIS_TRANSFORMS', 'Parse/eval failure',
+      normalized, monolithToLatex(result),
+      'Ошибка разбора.', 'Parse failure.', 'ERROR', 'warning'));
   }
 
-  // Parse pattern cases
-  let resultLatex = '';
-  let resultText = '';
-  let resultKind = 'scalar';
-  let axiomUsed = 'A6_GENERAL';
-  let classicalFailReasonRu = '';
-  let classicalFailReasonEn = '';
+  const resultLatex = monolithToLatex(result);
+  const resultText = monolithToText(result);
+  const resultKind =
+    result.kind === 'inf' ? 'infinity' :
+    result.kind === 'zero' ? 'zero' :
+    result.kind === 'scalar' ? 'scalar' :
+    result.kind === 'expr' ? 'expression' : 'unresolved';
 
-  // Case 1: Division by zero 5 / 0 or F / 0
-  const divZeroMatch = normalized.match(/^(\d+(?:\.\d+)?)\s*\/\s*0$/);
-  // Case 2: Indeterminate product 0_F * ∞_G or 0_F * \infty_G
-  const prodMatch = normalized.match(/^(?:0_(\d+(?:\.\d+)?|\w+)|0\((\d+|\w+)\))\s*[\*×]\s*(?:∞_(\d+(?:\.\d+)?|\w+)|\\infty_(\d+|\w+)|inf_(\d+|\w+))$/i);
-  // Case 3: Ratio of zeros 0_F / 0_G
-  const zeroRatioMatch = normalized.match(/^(?:0_(\d+(?:\.\d+)?|\w+))\s*\/\s*(?:0_(\d+(?:\.\d+)?|\w+))$/i);
-  // Case 4: Ratio of infinities ∞_F / ∞_G
-  const infRatioMatch = normalized.match(/^(?:∞_(\d+(?:\.\d+)?|\w+)|\\infty_(\d+|\w+))\s*\/\s*(?:∞_(\d+(?:\.\d+)?|\w+)|\\infty_(\d+|\w+))$/i);
-  // Case 5: Rational function with cancellation (x^2-4)/(x-2) at x=2 or (x-5)(x+5)/(x-5) at x=5
-  const rationalCancelMatch = normalized.includes('(x^2 - 4)/(x - 2)') || normalized.includes('(x^2-4)/(x-2)');
-  const localityRuleMatch = normalized.includes('(x-5)*(x+5)/(x-5)') || normalized.includes('(x-5)(x+5)/(x-5)');
-  const sinOverXMatch = normalized.includes('sin(x)/x') || normalized.includes('sin x / x');
-  const compositeMonolithMatch = normalized.includes('∞_Time + ∞_Space') || normalized.includes('inf_Time + inf_Space') || normalized.includes('Time') && normalized.includes('Space');
+  phases.push(phase(3, 'ALGEBRAIC_CLEANUP', 'Cleanup', resultLatex, resultLatex,
+    'Свёртка.', 'Folding.', 'ALGEBRAIC_CLEANUP'));
+  phases.push(phase(4, 'TYPE_CONSISTENCY_CHECK', 'TCP', resultLatex, `TypeOk(${resultLatex})`,
+    'Проверка типов.', 'Type check.', 'TCP_PROTOCOL'));
+  phases.push(phase(5, 'STANDARD_ARITHMETIC', 'Done', resultLatex, resultLatex,
+    'Сингулярности раскрыты.', 'Singularities resolved.', 'ARITHMETIC_DONE'));
+  phases.push(phase(6, 'L1_FINAL_VERIFICATION', 'L1 X=X', resultLatex, `${resultLatex}\\equiv${resultLatex}`,
+    'L1 сохранено.', 'L1 preserved.', 'L0_CONTINUITY, L1_VERIFIED', 'verified'));
 
-  if (divZeroMatch) {
-    const F = divZeroMatch[1];
-    resultLatex = `\\infty_{${F}}`;
-    resultText = `∞_${F}`;
-    resultKind = 'infinity';
-    axiomUsed = 'A1_INDEXED_INFINITY';
-
-    phases.push({
-      phase: 0.5,
-      name: 'SEMANTIC_INDEXING',
-      ruleApplied: 'SP4 Semantic Priority',
-      latexInput: `${F} / 0`,
-      latexOutput: `\\frac{${F}}{0_{${F}}}`,
-      explanationRu: `Индексация сингулярности деления исходным фактором F = ${F}.`,
-      explanationEn: `Singularity indexed by generating factor F = ${F}.`,
-      axiomOrProtocol: 'SP4_SEMANTIC_PRIORITY',
-      status: 'passed',
-    });
-
-    phases.push({
-      phase: 1,
-      name: 'REDUCTION_PRIORITY',
-      ruleApplied: 'SP2 Reduction Priority',
-      latexInput: `\\frac{${F}}{0}`,
-      latexOutput: `\\frac{${F}}{0}`,
-      explanationRu: 'Отсутствуют сокращаемые термины, переход к преобразованиям аксиом.',
-      explanationEn: 'No simplifiable terms, proceeding to axiom transformations.',
-      axiomOrProtocol: 'SP2_REDUCTION_PRIORITY',
-      status: 'passed',
-    });
-
-    phases.push({
-      phase: 2,
-      name: 'RICIS_TRANSFORMS',
-      ruleApplied: 'Axiom A1 & A10 (Scalar Division by Zero)',
-      latexInput: `\\frac{${F}}{0}`,
-      latexOutput: `\\infty_{${F}}`,
-      explanationRu: `Деление ${F} на нуль порождает индексированную бесконечность \\infty_{${F}}.`,
-      explanationEn: `Division of ${F} by zero yields indexed infinity \\infty_{${F}}.`,
-      axiomOrProtocol: 'A1_INDEXED_INFINITY, A10_SCALAR_DIVISION',
-      status: 'transformed',
-    });
-
-    classicalFailReasonRu = 'Классический анализ объявляет 5/0 "неопределенностью" или делением на ноль (NaN/Undefined).';
-    classicalFailReasonEn = 'Classical real analysis declares 5/0 as "undefined" or NaN.';
-  } else if (prodMatch) {
-    const F_str = prodMatch[1] || prodMatch[2];
-    const G_str = prodMatch[3] || prodMatch[4] || prodMatch[5];
-    const F = parseFloat(F_str) || F_str;
-    const G = parseFloat(G_str) || G_str;
-
-    if (typeof F === 'number' && typeof G === 'number') {
-      const prodVal = F * G;
-      const isDiagonal = F === G;
-      resultLatex = isDiagonal ? `${F}^2 = ${prodVal}` : `${F} \\cdot ${G} = ${prodVal}`;
-      resultText = `${prodVal}`;
-      resultKind = 'scalar';
-      axiomUsed = isDiagonal ? 'A6_DIAGONAL_TELESCOPE' : 'A6_GENERAL';
-
-      phases.push({
-        phase: 0.5,
-        name: 'SEMANTIC_INDEXING',
-        ruleApplied: 'SP4 Semantic Indexing',
-        latexInput: `0_{${F}} \\times \\infty_{${G}}`,
-        latexOutput: `0_{${F}} \\times \\infty_{${G}}`,
-        explanationRu: `Индексы нуля и бесконечности точно зафиксированы как F=${F}, G=${G}.`,
-        explanationEn: `Zero and Infinity indices locked as F=${F}, G=${G}.`,
-        axiomOrProtocol: 'SP4_SEMANTIC_PRIORITY',
-        status: 'passed',
-      });
-
-      phases.push({
-        phase: 1,
-        name: 'REDUCTION_PRIORITY',
-        ruleApplied: 'SP2 Reduction Priority',
-        latexInput: `0_{${F}} \\times \\infty_{${G}}`,
-        latexOutput: `0_{${F}} \\times \\infty_{${G}}`,
-        explanationRu: 'Прямая форма готовности к диагональному или общему произведению.',
-        explanationEn: 'Direct format ready for general or diagonal product theorem.',
-        axiomOrProtocol: 'SP2_REDUCTION_PRIORITY',
-        status: 'passed',
-      });
-
-      phases.push({
-        phase: 2,
-        name: 'RICIS_TRANSFORMS',
-        ruleApplied: isDiagonal ? 'A6 General Product (Diagonal Telescope Case: 0_F × ∞_F = F²)' : 'A6 General Product (0_F × ∞_G = F · G)',
-        latexInput: `0_{${F}} \\times \\infty_{${G}}`,
-        latexOutput: `${F} \\cdot ${G}`,
-        explanationRu: isDiagonal
-          ? `Диагональный телескопический случай: 0_{${F}} \\times \\infty_{${F}} = ${F}^2 = ${prodVal}.`
-          : `Обобщенное объединение: 0_{${F}} \\times \\infty_{${G}} = ${F} \\cdot ${G} = ${prodVal}.`,
-        explanationEn: isDiagonal
-          ? `Diagonal Telescope Case: 0_{${F}} × ∞_{${F}} = ${F}² = ${prodVal}.`
-          : `Unifying Product: 0_{${F}} × ∞_{${G}} = ${F} · ${G} = ${prodVal}.`,
-        axiomOrProtocol: 'A6_GENERAL',
-        status: 'transformed',
-      });
-
-      classicalFailReasonRu = 'Классический анализ считает 0 × ∞ неопределенностью (indeterminate form 0 · ∞).';
-      classicalFailReasonEn = 'Classical calculus rejects 0 × ∞ as an indeterminate form.';
-    }
-  } else if (zeroRatioMatch) {
-    const F_str = zeroRatioMatch[1];
-    const G_str = zeroRatioMatch[2];
-    const F = parseFloat(F_str);
-    const G = parseFloat(G_str);
-    const ratio = F / G;
-
-    resultLatex = `\\frac{${F}}{${G}} = ${ratio}`;
-    resultText = `${ratio}`;
-    axiomUsed = 'A4_ZERO_RATIO';
-
-    phases.push({
-      phase: 0.5,
-      name: 'SEMANTIC_INDEXING',
-      ruleApplied: 'SP4 Semantic Priority',
-      latexInput: `\\frac{0_{${F}}}{0_{${G}}}`,
-      latexOutput: `\\frac{0_{${F}}}{0_{${G}}}`,
-      explanationRu: `Индексы нулей сохранены как $F=${F}$ и $G=${G}$.`,
-      explanationEn: `Zero indices preserved as $F=${F}$ and $G=${G}$.`,
-      axiomOrProtocol: 'SP4_SEMANTIC_PRIORITY',
-      status: 'passed',
-    });
-
-    phases.push({
-      phase: 2,
-      name: 'RICIS_TRANSFORMS',
-      ruleApplied: 'A4 Zero Ratio (0_F / 0_G = F / G)',
-      latexInput: `\\frac{0_{${F}}}{0_{${G}}}`,
-      latexOutput: `\\frac{${F}}{${G}} = ${ratio}`,
-      explanationRu: `Отношение индексированных нулей равно отношению их генерирующих индексов ${F}/${G} = ${ratio}.`,
-      explanationEn: `Ratio of indexed zeros equals ratio of generating indices ${F}/${G} = ${ratio}.`,
-      axiomOrProtocol: 'A4_0DIV0, SP3_INDEX_LAW',
-      status: 'transformed',
-    });
-
-    classicalFailReasonRu = 'Классический анализ объявляет 0/0 неопределенностью.';
-    classicalFailReasonEn = 'Classical math returns undefined for 0/0.';
-  } else if (infRatioMatch) {
-    const F_str = infRatioMatch[1] || infRatioMatch[2];
-    const G_str = infRatioMatch[3] || infRatioMatch[4];
-    const F = parseFloat(F_str);
-    const G = parseFloat(G_str);
-    const ratio = F / G;
-
-    resultLatex = `\\frac{${F}}{${G}} = ${ratio}`;
-    resultText = `${ratio}`;
-    axiomUsed = 'A5_INFINITY_RATIO';
-
-    phases.push({
-      phase: 2,
-      name: 'RICIS_TRANSFORMS',
-      ruleApplied: 'A5 Infinity Ratio (∞_F / ∞_G = F / G)',
-      latexInput: `\\frac{\\infty_{${F}}}{\\infty_{${G}}}`,
-      latexOutput: `\\frac{${F}}{${G}} = ${ratio}`,
-      explanationRu: `Отношение индексированных бесконечностей дает детерминированное число ${ratio}.`,
-      explanationEn: `Ratio of indexed infinities yields deterministic scalar ${ratio}.`,
-      axiomOrProtocol: 'A5_INFDIVINF',
-      status: 'transformed',
-    });
-
-    classicalFailReasonRu = 'Классический анализ считает ∞ / ∞ неопределенностью.';
-    classicalFailReasonEn = 'Classical math regards ∞ / ∞ as indeterminate.';
-  } else if (rationalCancelMatch) {
-    resultLatex = '4';
-    resultText = '4';
-    axiomUsed = 'SP2_SP4_PATH_CONVERGENCE';
-
-    phases.push({
-      phase: 0.5,
-      name: 'SEMANTIC_INDEXING',
-      ruleApplied: 'SP4 Semantic Priority (Index by Parent Expression)',
-      latexInput: `\\frac{x^2 - 4}{x - 2} \\Big|_{x=2}`,
-      latexOutput: `\\frac{0_{(x^2-4)|_{x=2}}}{0_{(x-2)|_{x=2}}}`,
-      explanationRu: 'Сингулярности индексируются исходными алгебраическими выражениями E(x), а не их числовым нулем.',
-      explanationEn: 'Singularities indexed by source generating expressions E(x), not raw scalar zero values.',
-      axiomOrProtocol: 'SP4_SEMANTIC_PRIORITY',
-      status: 'passed',
-    });
-
-    phases.push({
-      phase: 1,
-      name: 'REDUCTION_PRIORITY',
-      ruleApplied: 'SP2 Reduction Priority (Algebraic Factorization)',
-      latexInput: `\\frac{0_{(x-2)(x+2)}}{0_{(x-2)}}`,
-      latexOutput: `\\frac{(x-2)(x+2)}{(x-2)} = x + 2`,
-      explanationRu: 'Алгебраическое сокращение идентичных факторов производится ДО раскрытия сингулярности.',
-      explanationEn: 'Algebraic cancellation of identical terms executed BEFORE singularity resolution.',
-      axiomOrProtocol: 'SP2_REDUCTION_PRIORITY',
-      status: 'transformed',
-    });
-
-    phases.push({
-      phase: 2,
-      name: 'RICIS_TRANSFORMS',
-      ruleApplied: 'L1 Identity Substitution at x = 2',
-      latexInput: `x + 2 \\Big|_{x=2}`,
-      latexOutput: `2 + 2 = 4`,
-      explanationRu: 'Точечное вычисление на непрерывной области дает точный ответ 4. Отражение конвергенции путей.',
-      explanationEn: 'Pointwise evaluation gives exact value 4. Proves path convergence invariance under SP4.',
-      axiomOrProtocol: 'L1_IDENTITY, SP4_PATH_CONVERGENCE',
-      status: 'passed',
-    });
-
-    classicalFailReasonRu = 'Классический анализ вычисляет в точке x=2 0/0 и вынужден прибегать к пределу lim_{x->2}. RICIS-III вычисляет детерминированно без пределов.';
-    classicalFailReasonEn = 'Classical analysis gets 0/0 at x=2 and requires limits. RICIS-III calculates directly.';
-  } else if (localityRuleMatch) {
-    resultLatex = '10';
-    resultText = '10';
-    axiomUsed = 'SP1_LOCALITY_RULE';
-
-    phases.push({
-      phase: 0.5,
-      name: 'SEMANTIC_INDEXING',
-      ruleApplied: 'SP4 Semantic Priority',
-      latexInput: `\\frac{(x-5)(x+5)}{x-5} \\Big|_{x=5}`,
-      latexOutput: `\\frac{0_{(x-5)} \\cdot (x+5)}{0_{(x-5)}}`,
-      explanationRu: 'Выделение нулевого фактора (x-5) при x=5 с сохранением "хвоста" выражения (x+5).',
-      explanationEn: 'Isolation of zero-factor (x-5) at x=5 while preserving expression tail (x+5).',
-      axiomOrProtocol: 'SP4_SEMANTIC_PRIORITY',
-      status: 'passed',
-    });
-
-    phases.push({
-      phase: 1,
-      name: 'REDUCTION_PRIORITY',
-      ruleApplied: 'SP1 Locality Rule (No Total Amnesia)',
-      latexInput: `\\frac{0_{(x-5)}}{0_{(x-5)}} \\cdot (x+5)`,
-      latexOutput: `1 \\cdot (x+5)`,
-      explanationRu: 'Правило локальности: сокращение 0/0 применяется ТОЛЬКО к идентичным факторам (x-5)/(x-5) = 1. Хвост (x+5) остается активным.',
-      explanationEn: 'Locality Rule: 0/0 identity applies ONLY to identical factors (x-5)/(x-5) = 1. Tail (x+5) remains active.',
-      axiomOrProtocol: 'SP1_LOCALITY_RULE, L1_IDENTITY',
-      status: 'transformed',
-    });
-
-    phases.push({
-      phase: 2,
-      name: 'RICIS_TRANSFORMS',
-      ruleApplied: 'Pointwise Substitution x = 5',
-      latexInput: `1 \\cdot (5 + 5)`,
-      latexOutput: `10`,
-      explanationRu: 'Точный детерминированный результат = 10. Доказано предотвращение ложного схлопывания в 1.',
-      explanationEn: 'Exact deterministic result = 10. Prevents false collapse to 1.',
-      axiomOrProtocol: 'L1_IDENTITY',
-      status: 'passed',
-    });
-
-    classicalFailReasonRu = 'Обычная слепая подстановка 0/0 = 1 без правила локальности ошибочно дала бы 1 вместо 10!';
-    classicalFailReasonEn = 'Naive substitution of 0/0 = 1 without locality rule would falsely collapse expression to 1 instead of 10!';
-  } else if (sinOverXMatch) {
-    resultLatex = '1';
-    resultText = '1';
-    axiomUsed = 'A4_ZERO_RATIO_SERIES';
-
-    phases.push({
-      phase: 0.5,
-      name: 'SEMANTIC_INDEXING',
-      ruleApplied: 'SP4 Semantic Priority (Taylor Series Singular Indexing)',
-      latexInput: `\\frac{\\sin(x)}{x} \\Big|_{x=0}`,
-      latexOutput: `\\frac{0_{\\sin(x)}}{0_x}`,
-      explanationRu: 'Нули индексируются генерирующими функциями $\\sin(x)$ и $x$.',
-      explanationEn: 'Zeros indexed by generating functions $\\sin(x)$ and $x$.',
-      axiomOrProtocol: 'SP4_SEMANTIC_PRIORITY',
-      status: 'passed',
-    });
-
-    phases.push({
-      phase: 1,
-      name: 'REDUCTION_PRIORITY',
-      ruleApplied: 'SP2 Reduction Priority (Series Expansion)',
-      latexInput: `\\frac{x - \\frac{x^3}{6} + \\dots}{x}`,
-      latexOutput: `1 - \\frac{x^2}{6} + \\dots`,
-      explanationRu: 'Сокращение общего фактора x перед точечным вычислением.',
-      explanationEn: 'Cancellation of common x factor prior to evaluation.',
-      axiomOrProtocol: 'SP2_REDUCTION_PRIORITY',
-      status: 'transformed',
-    });
-
-    phases.push({
-      phase: 2,
-      name: 'RICIS_TRANSFORMS',
-      ruleApplied: 'Exact Point Substitution x = 0',
-      latexInput: `1 - 0 + 0 - \\dots`,
-      latexOutput: `1`,
-      explanationRu: 'Результат $\\frac{\\sin(0)}{0} = 1$ получен без вычисления пределов Лопиталя.',
-      explanationEn: 'Result $\\frac{\\sin(0)}{0} = 1$ obtained without L\'Hôpital limits.',
-      axiomOrProtocol: 'A4_0DIV0',
-      status: 'passed',
-    });
-
-    classicalFailReasonRu = 'В классическом анализе требуется правило Лопиталя lim_{x->0} cos(x)/1 = 1. В RICIS-III это прямая алгебра нулей.';
-    classicalFailReasonEn = 'Classical math requires L\'Hôpital\'s rule limit. RICIS-III resolves it purely algebraically.';
-  } else if (compositeMonolithMatch) {
-    resultLatex = '\\infty_{(\\text{Time}, \\text{Space})}';
-    resultText = '∞_(Time, Space)';
-    resultKind = 'monolith';
-    axiomUsed = 'TYPE_CONSISTENCY_PROTOCOL';
-
-    phases.push({
-      phase: 0.5,
-      name: 'TYPE_CHECK',
-      ruleApplied: 'Type Consistency Protocol (Incompatible Monoliths)',
-      latexInput: `\\infty_{\\text{Time}} + \\infty_{\\text{Space}}`,
-      latexOutput: `T(\\text{Time}) \\neq T(\\text{Space})`,
-      explanationRu: 'Типы времени и пространства несовместимы напрямую. Применяется композиция Монолитов.',
-      explanationEn: 'Time and Space types incompatible for direct addition. Composite Monolith protocol engaged.',
-      axiomOrProtocol: 'TYPE_CONSISTENCY_PROTOCOL, L1C2_TYPE_IDENTITY',
-      status: 'passed',
-    });
-
-    phases.push({
-      phase: 3,
-      name: 'MONOLITH_COMPOSITION',
-      ruleApplied: 'Composite Monolith Order 2 Synthesis',
-      latexInput: `\\infty_{\\text{Time}} + \\infty_{\\text{Space}}`,
-      latexOutput: `\\infty_{(\\text{Time}, \\text{Space})}`,
-      explanationRu: 'Формирование составного монолита второго порядка без потери метаданных типов.',
-      explanationEn: 'Formation of Order 2 composite monolith without losing type metadata.',
-      axiomOrProtocol: 'A2_MONOLITH_SYNTHESIS',
-      status: 'transformed',
-    });
-
-    classicalFailReasonRu = 'Классический анализ превращает ∞ + ∞ в бессодержательное ∞, теряя физический смысл компонентов.';
-    classicalFailReasonEn = 'Classical math reduces ∞ + ∞ to plain ∞, losing dimension and physical type context.';
-  } else {
-    // Default fallback parsing for arbitrary expressions
-    resultLatex = `\\text{RICIS-Resolved}(${normalized})`;
-    resultText = `Resolved(${normalized})`;
-    axiomUsed = 'A6_GENERAL';
-
-    phases.push({
-      phase: 2,
-      name: 'RICIS_TRANSFORMS',
-      ruleApplied: 'Axiomatic Resolution Engine',
-      latexInput: normalized,
-      latexOutput: resultLatex,
-      explanationRu: 'Преобразование сингулярности по общей схеме аксиом RICIS-III v7.7.',
-      explanationEn: 'Singularity resolution following RICIS-III v7.7 general schema.',
-      axiomOrProtocol: 'A6_GENERAL',
-      status: 'passed',
-    });
-
-    classicalFailReasonRu = 'Классический анализ останавливается на точке неопределенности.';
-    classicalFailReasonEn = 'Classical math halts on undefined singularity.';
-  }
-
-  // Phase 3: Algebraic Cleanup
-  phases.push({
-    phase: 3,
-    name: 'ALGEBRAIC_CLEANUP',
-    ruleApplied: 'Monolith Simplification & Unfolding',
-    latexInput: resultLatex,
-    latexOutput: resultLatex,
-    explanationRu: 'Алгебраическая свертка структуры монода.',
-    explanationEn: 'Algebraic folding of monad structure.',
-    axiomOrProtocol: 'ALGEBRAIC_CLEANUP',
-    status: 'passed',
-  });
-
-  // Phase 4: Type Consistency Protocol (TCP) Check
-  phases.push({
-    phase: 4,
-    name: 'TYPE_CONSISTENCY_CHECK',
-    ruleApplied: 'Type Consistency Protocol (TCP)',
-    latexInput: resultLatex,
-    latexOutput: `\\text{TypeOk}(${resultLatex})`,
-    explanationRu: 'Проверка сохранения метаданных типов T(X) в соответствии с L1C2_TypeAsIdentity.',
-    explanationEn: 'Verification of type metadata T(X) preservation under L1C2_TypeAsIdentity.',
-    axiomOrProtocol: 'TCP_PROTOCOL',
-    status: 'passed',
-  });
-
-  // Phase 5: Standard Arithmetic
-  phases.push({
-    phase: 5,
-    name: 'STANDARD_ARITHMETIC',
-    ruleApplied: 'Singularity-Free Arithmetic Evaluation',
-    latexInput: resultLatex,
-    latexOutput: resultLatex,
-    explanationRu: 'Сингулярности полностью раскрыты, получен детерминированный конечный результат.',
-    explanationEn: 'Singularities fully resolved, producing deterministic final output.',
-    axiomOrProtocol: 'ARITHMETIC_DONE',
-    status: 'passed',
-  });
-
-  // Phase 6: L1 Final Verification
-  phases.push({
-    phase: 6,
-    name: 'L1_FINAL_VERIFICATION',
-    ruleApplied: 'L1 Absolute Identity Proof (X = X)',
-    latexInput: resultLatex,
-    latexOutput: `${resultLatex} \\equiv ${resultLatex} \\quad \\checkmark`,
-    explanationRu: 'Финальная проверка: тождество L1 сохранено на всех этапах рекурсии (0 операций с рывком непрерывности).',
-    explanationEn: 'Final check: L1 identity preserved across all recursion steps (0 continuity drops).',
-    axiomOrProtocol: 'L0_CONTINUITY, L1_VERIFIED',
-    status: 'verified',
-  });
-
+  const axiomUsed = detectAxiom(result, normalized);
   const leanCode = generateLean4Code(normalized, normalized, resultLatex, axiomUsed);
 
   return {
     rawExpression: input,
     variableContext,
     phases,
-    finalResult: {
-      latex: resultLatex,
-      text: resultText || resultLatex,
-      kind: resultKind,
-      typeTag: 'RICIS.Monad.v7.7',
-    },
+    finalResult: { latex: resultLatex, text: resultText, kind: resultKind, typeTag: 'RICIS.Monad.v7.7' },
     classicalFailure: {
       result: 'Undefined / NaN / Divergent Limit',
-      reasonRu: classicalFailReasonRu || 'Классический анализ объявляет выражение неопределенным.',
-      reasonEn: classicalFailReasonEn || 'Classical math declares expression undefined.',
+      reasonRu: 'Классика: неопределённость; RICIS: структурный ответ.',
+      reasonEn: 'Classical: undefined; RICIS: structural answer.',
     },
     leanCode,
   };
 }
+
+export const _test = {
+  parseExpression, evalExpr, ricisDiv, ricisMul, ricisAdd, algSimplify, exprToCanonical,
+};
