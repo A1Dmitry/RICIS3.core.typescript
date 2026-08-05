@@ -1,6 +1,6 @@
 {
-  "name": "RICIS-III v7.7 Engine & Formal Validation Runtime",
-  "description": "Formal mathematical validation engine and runtime for RICIS-III v7.7 (Recursive Indexed Calculus of Identity and Singularity) by Dmitry Aleinikov.",
+  "name": "RICIS-III Expansion — Singularity Map",
+  "description": "Интерактивная 3D-карта проблем сингулярности с формальным ядром RICIS-III",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

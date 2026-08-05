@@ -1,7 +1,7 @@
-import express from 'express';
-import path from 'path';
-import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI } from '@google/genai';
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI } from "@google/genai";
 
 async function startServer() {
   const app = express();
@@ -9,63 +9,286 @@ async function startServer() {
 
   app.use(express.json());
 
-  // API Route: Health check
-  app.get('/api/health', (req, res) => {
-    res.json({
-      status: 'ok',
-      system: 'RICIS-III v7.7 Engine',
-      author: 'Dmitry Aleinikov (ORCID: 0009-0004-3226-7700)',
-      dois: ['10.5281/zenodo.17872755', '10.5281/zenodo.21517353'],
-    });
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok" });
   });
 
-  // API Route: Gemini RICIS Verification Assistant
-  app.post('/api/ricis/verify', async (req, res) => {
+  app.post("/api/generateProof", async (req, res) => {
     try {
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) {
-        return res.status(400).json({ error: 'GEMINI_API_KEY environment variable is not set.' });
-      }
+      const { title, targetFunction, axioms } = req.body;
 
-      const { expression, prompt } = req.body;
-      const ai = new GoogleGenAI({ apiKey });
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `You are the formal RICIS-III v7.7 validation engine authored by Dmitry Aleinikov (ORCID: 0009-0004-3226-7700).
-Evaluate expression: "${expression}"
-User Query: "${prompt || 'Provide step-by-step Phase -1 to Phase 6 trace in Russian and Lean 4 formal code.'}"
-Strict Rules:
-- L0: Absolute Continuity, L1: Identity Principle (X = X).
-- SP1 Locality Rule, SP2 Reduction Priority, SP3 Index Law, SP4 Semantic Priority.
-- Axioms A1-A10 (A1: F/0 = ∞_F, A4: 0_F/0_G = F/G, A5: ∞_F/∞_G = F/G, A6: 0_F × ∞_G = F·G).
-- Strictly reject Cauchy limits (lim x->a), L'Hopital rule, NaN/Undefined states.
-Output in Russian with Lean 4 theorem code.`,
+      const ai = new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY || "dummy",
+        httpOptions: {
+          headers: {
+            "User-Agent": "aistudio-build",
+          },
+        },
       });
 
-      res.json({ text: response.text });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Verification failed.' });
+      const axiomList =
+        axioms && axioms.length > 0
+          ? axioms.map((a) => a.formalStatement).join("\n")
+          : "None available";
+
+      const prompt = `You are the RICIS-III agent. Your task is to generate a formal proof for the problem node.
+
+Strictly follow the RICIS-III methodology. DO NOT use classical limits or integrals; replace them with their RICIS analogs (structural point evaluation without limit processes, plane difference). Use the provided resolved problems as axioms from the database for further proofs.
+
+Problem Title: ${title}
+Target Function: ${targetFunction}
+Available Axioms (Resolved Problems):
+${axiomList}
+
+Provide the output as a valid LaTeX document section. Use mathematical notation and refer to the provided axioms if applicable. Keep it concise, professional, and do not use generic AI filler.
+STRICT LaTeX OUTPUT RULES:
+1. Return ONLY a FRAGMENT: paragraphs and math environments. NO \\documentclass, NO \\usepackage, NO \\begin{document}, NO markdown.
+2. DO NOT use \\section, \\subsection, or \\chapter. Use \\textbf{...} for headings instead.
+3. ASCII math only: $\\infty$ $\\to$ $\\leq$ --- never unicode.
+4. Pair every $. Pair every \\begin{env}/\\end{env}. Allowed: equation*, align*, itemize, enumerate.
+5. Max 60 lines. No HTML, no JSON, no error messages.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
+
+      let text = response.text || "Failed to generate proof.";
+      if (text.startsWith("```latex")) {
+        text = text.substring(8);
+      }
+      if (text.startsWith("```")) {
+        text = text.substring(3);
+      }
+      if (text.endsWith("```")) {
+        text = text.substring(0, text.length - 3);
+      }
+
+      res.json({ proofLatex: text.trim() });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
     }
   });
 
-  // Vite middleware for development vs static build in production
-  if (process.env.NODE_ENV !== 'production') {
+  app.post("/api/discoverTasks", async (req, res) => {
+    try {
+      const { parentNode, existingTitles } = req.body;
+      const ai = new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY || "dummy",
+        httpOptions: {
+          headers: { "User-Agent": "aistudio-build" },
+        },
+      });
+      const prompt = `You are a scientific AI agent following the RICIS-III methodology.
+Based on the solved problem "${parentNode.title}" (target function: ${parentNode.targetFunction}), discover 1 to 2 NEW, REAL scientific or mathematical problems (not fake or generic) that logically depend on this solved problem or are in the same domain.
+Perform a real search in your LLM knowledge base for real open problems, theorems, or singularities.
+The existing problems on the map are: ${existingTitles.join(", ")}. Do not return duplicates.
+Return the result STRICTLY as a JSON array of objects with the following keys:
+- "title": Real problem title
+- "description": Short description
+- "targetFunction": Mathematical formulation or target function (e.g. "lim x->0 ...")
+- "singularityHint": Hint about where the singularity is
+- "zoneId": One of ["math", "physics", "informatics", "medicine", "pharmacology", "economics", "ethics"]
+- "type": "scientific_task" or "core_singularity"
+- "sourceUrl": A REAL, existing Wikipedia or scientific link (URL) describing the problem. DO NOT MAKE UP URLs.
+Output ONLY valid JSON.`;
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
+      let text = response.text || "[]";
+      const match = text.match(/\[[\s\S]*\]/);
+      if (match) {
+        text = match[0];
+      }
+      res.json({ tasks: JSON.parse(text.trim()) });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/aiAssistantNode", async (req, res) => {
+    try {
+      const { title, targetFunction } = req.body;
+      const ai = new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY || "dummy",
+        httpOptions: {
+          headers: {
+            "User-Agent": "aistudio-build",
+          },
+        },
+      });
+      const prompt = `You are a scientific AI assistant. The user wants to add a new problem to the RICIS-III map.
+Title: ${title || "Not provided"}
+Target Function (rough): ${targetFunction || "Not provided"}
+
+Please do the following:
+1. If Title is "Not provided" or very vague, generate a formal scientific title for this mathematical problem.
+2. Normalize and strictly formalize the "Target Function" into a mathematical expression or limit involving a singularity (e.g. lim x->0 ... or Formalize(...)).
+3. Provide a short, rigorous scientific description of the problem (in Russian).
+4. Provide a hint about where the singularity is (in Russian).
+5. Provide a REAL, existing Wikipedia or scientific link (URL). DO NOT MAKE UP URLs. USE REAL LINKS.
+
+Return the result STRICTLY as a JSON object with the keys:
+- "title": string
+- "normalizedFunction": string
+- "description": string
+- "hint": string
+- "link": string
+
+Output ONLY valid JSON.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
+
+      let text = response.text || "{}";
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) {
+        text = match[0];
+      }
+      res.json(JSON.parse(text.trim()));
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/fillNodeParams", async (req, res) => {
+    try {
+      const { id, title, description, singularityHint, type, zoneIds } = req.body || {};
+      const ai = new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY || "dummy",
+        httpOptions: {
+          headers: { "User-Agent": "aistudio-build" },
+        },
+      });
+
+      const prompt = `You are the RICIS-III map curator. A problem node is missing its targetFunction (formal singularity expression).
+
+Use scientific knowledge of open problems, Clay Millennium problems, classical singularities, and standard formulations (Wikipedia / textbooks / arXiv-style naming). Prefer real mathematical target functions when the title is recognizable.
+
+Node id: ${id || "unknown"}
+Title: ${title || "unknown"}
+Current description: ${description || "(empty)"}
+Singularity hint: ${singularityHint || "(empty)"}
+Type: ${type || "scientific_task"}
+Zones: ${Array.isArray(zoneIds) ? zoneIds.join(", ") : ""}
+
+Return STRICT JSON only with keys:
+- "targetFunction": string — formal expression or procedure name
+- "description": string — short rigorous description in Russian (1–3 sentences)
+- "singularityHint": string — where the singularity / obstruction sits (Russian, short)
+- "title": string — keep or lightly normalize the title
+- "sourceUrl": string — A REAL, existing Wikipedia or scientific link (URL). DO NOT MAKE UP URLs.
+
+Rules:
+- Never leave targetFunction empty.
+- Do not invent Clay prize claims unless the title clearly matches a known problem.
+- Output ONLY valid JSON.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: { responseMimeType: "application/json" },
+      });
+
+      let text = response.text || "{}";
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) text = match[0];
+      const parsed = JSON.parse(text.trim());
+      if (!parsed.targetFunction || !String(parsed.targetFunction).trim()) {
+        return res.status(502).json({ error: "agent_returned_empty_targetFunction" });
+      }
+      res.json({
+        targetFunction: String(parsed.targetFunction).trim(),
+        description: parsed.description ? String(parsed.description).trim() : undefined,
+        singularityHint: parsed.singularityHint
+          ? String(parsed.singularityHint).trim()
+          : undefined,
+        title: parsed.title ? String(parsed.title).trim() : undefined,
+        sourceUrl: parsed.sourceUrl ? String(parsed.sourceUrl).trim() : undefined,
+      });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/findDerivatives", async (req, res) => {
+    try {
+      const { existingTitles } = req.body || {};
+      const ai = new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY || "dummy",
+        httpOptions: {
+          headers: { "User-Agent": "aistudio-build" },
+        },
+      });
+
+      const prompt = `You are a scientific AI agent tasked with finding real-world publications, preprints, or projects that discuss resolving singularities by indexing zero or infinity, division by zero equal to one (0/0=1), evaluating 0 * infinity with indices, or avoiding limits by structural point evaluation. These might be independent discoveries, similar frameworks, or derivative works similar to the RICIS-III methodology.
+Find 2 REAL, existing papers, articles, or resources (e.g., from arXiv, viXra, ResearchGate, or general physics/math literature) that discuss these specific topics. DO NOT MAKE UP URLs. USE REAL LINKS.
+The existing problems on the map are: ${existingTitles?.join(", ") || 'none'}. Do not return duplicates.
+Return the result STRICTLY as a JSON array of objects with the following keys:
+- "title": Real publication or claim title
+- "targetFunction": The main mathematical formula or concept discussed (e.g. "0/0", "F(x)/G(x)")
+- "description": Short rigorous description in Russian explaining how it relates to resolving singularities
+- "singularityHint": Hint about the specific rule used (e.g. SP2, SP4, A6)
+- "firstMentionDate": ISO date of publication or first mention
+- "sourceUrl": The REAL URL to the publication or resource
+- "zoneId": One of ["math", "physics", "informatics"]
+- "matchedSignatures": Array of strings, e.g. ["SP2", "A6", "0_F/0_G"]
+- "derivativeScore": A number between 0 and 1 indicating similarity to RICIS
+Output ONLY valid JSON.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
+
+      let text = response.text || "[]";
+      const match = text.match(/\[[\s\S]*\]/);
+      if (match) {
+        text = match[0];
+      }
+
+      res.json({ candidates: JSON.parse(text.trim()) });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: 'spa',
+      appType: "spa",
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`RICIS-III v7.7 Server running on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
