@@ -199,7 +199,7 @@ export async function discoverNewProblems(
     { parentNode: anchor, existingTitles }
   );
 
-  if (!api.ok) {
+  if (api.ok === false) {
     // Offline / static-host fallback: expand from anchor structure without LLM.
     // Keeps graph-walk usable on GitHub Pages; marks tasks as structural.
     if (api.isStaticHost) {

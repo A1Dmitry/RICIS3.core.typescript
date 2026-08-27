@@ -31,7 +31,7 @@ export function AddNodeModal({ onClose, parentId }: { onClose: () => void; paren
         hint?: string;
         link?: string;
       }>('/api/aiAssistantNode', { title, targetFunction });
-      if (!api.ok) {
+      if (api.ok === false) {
         setErrorMsg(api.error);
       } else {
         const data = api.data;
