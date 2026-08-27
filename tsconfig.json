@@ -22,5 +22,9 @@
     },
     "allowImportingTsExtensions": true,
     "noEmit": true
-  }
+  },
+  "exclude": [
+    "fix_jsx.cjs",
+    "fix_jsx3.cjs"
+  ]
 }

@@ -133,7 +133,7 @@ export async function fillMissingTargetFunctions(
         type: node.type,
         zoneIds: node.zoneIds,
       });
-      if (!api.ok) {
+      if (api.ok === false) {
         failed++;
         errors.push(`${node.id}: ${api.error}`);
         // On static host, one clear error is enough — stop the loop.

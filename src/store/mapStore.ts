@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { MapState, ProblemNode, DependencyEdge, Zone } from '../model/types';
+import { MapState, ProblemNode, DependencyEdge } from '../model/types';
 import { initialMap } from '../model/initialMap';
 import { solveNodeLogic } from '../model/logic';
 import { applyAgentDiscoveries, catalogExhausted, remainingCatalogCount } from '../model/agent';
@@ -224,7 +224,7 @@ export const useMapStore = create<MapStore>((set, get) => ({
         existingTitles
       });
 
-      if (!api.ok) {
+      if (api.ok === false) {
         if (api.isStaticHost) {
           // Offline fallback
           const mockCandidates = [
